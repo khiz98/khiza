@@ -141,22 +141,10 @@ def get_member_id(name):
 
 
 def add_transaction(tx_date, amount, member_id, payment_method, tx_type, comments="", source_ref=""):
-    amount = float(amount)
-    if tx_type == "Savings Withdrawal":
-        if member_id is None:
-            raise ValueError("A savings withdrawal must be assigned to a member.")
-        available = member_savings_balance(int(member_id), tx_date)
-        if amount > available + 1e-9:
-            member_name = df_query("SELECT name FROM members WHERE id=?", (int(member_id),))
-            name = member_name.iloc[0]["name"] if not member_name.empty else "this member"
-            raise ValueError(
-                f"Withdrawal rejected: {name} has only {money(available)} available accumulated savings "
-                f"as of {pd.Timestamp(tx_date).date()}. The requested withdrawal is {money(amount)}."
-            )
     return execute(
         """INSERT INTO transactions(tx_date,amount,member_id,payment_method,tx_type,comments,source_ref)
            VALUES (?,?,?,?,?,?,?)""",
-        (str(tx_date), amount, member_id, payment_method.strip(), tx_type, comments.strip(), source_ref),
+        (str(tx_date), float(amount), member_id, payment_method.strip(), tx_type, comments.strip(), source_ref),
     )
 
 
@@ -202,7 +190,41 @@ def loan_state(loan_id, as_of=None):
     }
 
 
+def available_fund(as_of=None):
+    """Cash available for new lending after all recorded fund inflows/outflows."""
+    as_of = str(as_of or date.today())
+    with conn() as c:
+        row = c.execute(
+            """SELECT
+                 COALESCE(SUM(CASE WHEN tx_type IN (
+                     'Saving','Loan repayment','Loan interest',
+                     'Interest on Deposit','Extra','Voluntary Contribution/Fines'
+                 ) THEN amount ELSE 0 END),0) -
+                 COALESCE(SUM(CASE WHEN tx_type IN ('Loan','Savings Withdrawal')
+                     THEN amount ELSE 0 END),0)
+               FROM transactions WHERE tx_date<=?""",
+            (as_of,),
+        ).fetchone()
+    return max(float(row[0]), 0.0)
+
+
+def max_new_loan(as_of=None):
+    """Maximum new loan = 80% of the currently available fund; 20% stays reserved."""
+    return available_fund(as_of) * 0.80
+
+
 def record_loan(member_id, amount, loan_date, purpose, method):
+    amount = float(amount)
+    fund = available_fund(loan_date)
+    max_loan = fund * 0.80
+    if amount > max_loan + 1e-9:
+        raise ValueError(
+            f"Loan request exceeds the 80% lending limit. Available fund: "
+            f"{money(fund)}; maximum loan allowed: {money(max_loan)}; "
+            f"requested: {money(amount)}. The remaining 20% must stay reserved."
+        )
+    if amount <= 0:
+        raise ValueError("Loan amount must be greater than zero.")
     tx_id = add_transaction(loan_date, amount, member_id, method, "Loan", purpose)
     rate = float(setting("monthly_loan_rate", "0.02"))
     return execute(
@@ -428,12 +450,7 @@ def dashboard():
         s = loan_state(int(lid))
         principal += s["principal_outstanding"]
         interest += s["accrued_interest"]
-    cash_in = 0.0
-    cash_out = 0.0
-    if not tx.empty:
-        cash_in = tx.loc[tx.tx_type.isin(["Saving", "Loan repayment", "Loan interest", "Interest on Deposit", "Extra", "Voluntary Contribution/Fines"]), "amount"].sum()
-        cash_out = tx.loc[tx.tx_type.isin(["Loan", "Savings Withdrawal"]), "amount"].sum()
-    available = cash_in - cash_out
+    available = available_fund()
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Member savings + earnings", money(savings))
@@ -483,16 +500,13 @@ def transactions_page():
             submitted = st.form_submit_button("Save transaction", type="primary")
             if submitted:
                 mid = int(name_to_id[member]) if member else None
-                try:
-                    txid = add_transaction(tx_date, amount, mid, method, tx_type, comments)
-                    if distribute and tx_type in {"Interest on Deposit", "Extra", "Voluntary Contribution/Fines"}:
-                        n = distribute_income(txid, amount, tx_date)
-                        st.success(f"Saved and distributed across {n} active members.")
-                    else:
-                        st.success("Transaction saved.")
-                    st.rerun()
-                except ValueError as e:
-                    st.error(str(e))
+                txid = add_transaction(tx_date, amount, mid, method, tx_type, comments)
+                if distribute and tx_type in {"Interest on Deposit", "Extra", "Voluntary Contribution/Fines"}:
+                    n = distribute_income(txid, amount, tx_date)
+                    st.success(f"Saved and distributed across {n} active members.")
+                else:
+                    st.success("Transaction saved.")
+                st.rerun()
 
     st.subheader("Ledger")
     ledger = df_query(
@@ -539,12 +553,22 @@ def loans_page():
             member = c1.selectbox("Borrower", m["name"].tolist())
             amount = c2.number_input("Loan amount", min_value=1.0, step=50.0)
             d = c3.date_input("Disbursement date", date.today())
+            fund = available_fund(d)
+            max_loan = fund * 0.80
+            st.caption(f"Available fund: {money(fund)} · Maximum new loan (80%): {money(max_loan)} · 20% reserved: {money(fund * 0.20)}")
+            if amount > max_loan and max_loan > 0:
+                st.warning(f"Requested amount is above the 80% limit. Maximum allowed is {money(max_loan)}.")
+            elif fund <= 0:
+                st.warning("No available fund for a new loan. The 20% reserve rule leaves the maximum new loan at 0 TJS.")
             method = st.text_input("Payment method")
             purpose = st.text_input("Purpose")
             if st.form_submit_button("Issue loan", type="primary"):
-                lid = record_loan(int(name_to_id[member]), amount, d, purpose, method)
-                st.success(f"Loan #{lid} issued. Interest will accrue automatically at {float(setting('monthly_loan_rate'))*100:.2f}% per month.")
-                st.rerun()
+                try:
+                    lid = record_loan(int(name_to_id[member]), amount, d, purpose, method)
+                    st.success(f"Loan #{lid} issued. Interest will accrue automatically at {float(setting('monthly_loan_rate'))*100:.2f}% per month.")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
 
     with tab3:
         open_loans = df_query(
