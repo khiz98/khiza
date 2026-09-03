@@ -1,0 +1,3 @@
+# Copy this to .streamlit/secrets.toml for local use.
+# On Streamlit Community Cloud, add the same value under App Settings > Secrets.
+APP_PASSWORD = "change-this-password"
