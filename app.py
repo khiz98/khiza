@@ -141,10 +141,22 @@ def get_member_id(name):
 
 
 def add_transaction(tx_date, amount, member_id, payment_method, tx_type, comments="", source_ref=""):
+    amount = float(amount)
+    if tx_type == "Savings Withdrawal":
+        if member_id is None:
+            raise ValueError("A savings withdrawal must be assigned to a member.")
+        available = member_savings_balance(int(member_id), tx_date)
+        if amount > available + 1e-9:
+            member_name = df_query("SELECT name FROM members WHERE id=?", (int(member_id),))
+            name = member_name.iloc[0]["name"] if not member_name.empty else "this member"
+            raise ValueError(
+                f"Withdrawal rejected: {name} has only {money(available)} available accumulated savings "
+                f"as of {pd.Timestamp(tx_date).date()}. The requested withdrawal is {money(amount)}."
+            )
     return execute(
         """INSERT INTO transactions(tx_date,amount,member_id,payment_method,tx_type,comments,source_ref)
            VALUES (?,?,?,?,?,?,?)""",
-        (str(tx_date), float(amount), member_id, payment_method.strip(), tx_type, comments.strip(), source_ref),
+        (str(tx_date), amount, member_id, payment_method.strip(), tx_type, comments.strip(), source_ref),
     )
 
 
@@ -471,13 +483,16 @@ def transactions_page():
             submitted = st.form_submit_button("Save transaction", type="primary")
             if submitted:
                 mid = int(name_to_id[member]) if member else None
-                txid = add_transaction(tx_date, amount, mid, method, tx_type, comments)
-                if distribute and tx_type in {"Interest on Deposit", "Extra", "Voluntary Contribution/Fines"}:
-                    n = distribute_income(txid, amount, tx_date)
-                    st.success(f"Saved and distributed across {n} active members.")
-                else:
-                    st.success("Transaction saved.")
-                st.rerun()
+                try:
+                    txid = add_transaction(tx_date, amount, mid, method, tx_type, comments)
+                    if distribute and tx_type in {"Interest on Deposit", "Extra", "Voluntary Contribution/Fines"}:
+                        n = distribute_income(txid, amount, tx_date)
+                        st.success(f"Saved and distributed across {n} active members.")
+                    else:
+                        st.success("Transaction saved.")
+                    st.rerun()
+                except ValueError as e:
+                    st.error(str(e))
 
     st.subheader("Ledger")
     ledger = df_query(
